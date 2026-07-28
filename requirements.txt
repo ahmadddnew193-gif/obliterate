@@ -1,0 +1,7 @@
+streamlit
+torch
+transformers
+datasets
+accelerate
+safetensors
+huggingface-hub
