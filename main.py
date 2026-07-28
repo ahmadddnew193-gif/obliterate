@@ -1219,7 +1219,7 @@ def abliterate_model(
                 directions.keys())[0]
             top_directions[key] = directions[key]
     else:
-        for idx in sorted_layers[:num_directions]:
+        for idx in sorted_layers[:int(num_directions)]:
             if idx in directions:
                 top_directions[idx] = directions[idx]
 
