@@ -118,8 +118,11 @@ def empty_cache():
         if hasattr(torch.mps, "empty_cache"):
             torch.mps.empty_cache()
 
-if is_cuda() and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+def configure_cuda():
+    if is_cuda() and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+configure_cuda()
 
 # ── Layer architecture registry ────────────────────────────────────
 LAYER_ATTR_PATHS = {
@@ -294,18 +297,15 @@ def init_session_state():
         "tokenizer": None,
         "config": None,
         "model_name": None,
-        "model_handle": None,
         "abliterated_model": None,
         "abliterated_tokenizer": None,
         "abliterated_config": None,
         "abliterated_name": None,
-        "original_snapshot": None,
         "status": "idle",
         "log": [],
         "metrics": None,
         "chat_history": [],
         "bench_results": None,
-        "bench_models": [],
         "method_params": {},
         "obliteration_progress": 0.0,
         "obliteration_stage": "",
@@ -320,6 +320,21 @@ init_session_state()
 
 def log_msg(msg):
     st.session_state.log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+
+def clear_model_from_memory():
+    st.session_state.model = None
+    st.session_state.tokenizer = None
+    st.session_state.config = None
+    st.session_state.model_loaded = False
+    st.session_state.model_name = None
+    if st.session_state.abliterated_model is not None:
+        st.session_state.abliterated_model = None
+        st.session_state.abliterated_tokenizer = None
+        st.session_state.abliterated_config = None
+        st.session_state.abliterated_name = None
+    gc.collect()
+    empty_cache()
+    log_msg("Model unloaded from memory")
 
 # ── 842 Built-in Prompts ──────────────────────────────────────────
 BUILTIN_HARMFUL = [
@@ -924,14 +939,14 @@ ABLITERATION_METHODS = {
     },
 }
 
-# ── Model Loading ──────────────────────────────────────────────────
-@st.cache_resource(show_spinner=False)
+# ── Model Loading (NOT cached) ─────────────────────────────────────
 def load_hf_model(model_name: str):
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-    log_msg(f"Loading model: {model_name}...")
     device = get_device()
     torch_dtype = torch.float16 if device == "cuda" else torch.float32
+
+    logger.info(f"Loading model: {model_name} (device={device}, dtype={torch_dtype})")
 
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
 
@@ -969,10 +984,6 @@ def load_hf_model(model_name: str):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    log_msg(f"Model loaded: {model_name}")
-    log_msg(f"Architecture: {getattr(config, 'model_type', 'unknown')}")
-    log_msg(f"Device: {device}")
-
     return model, tokenizer, config
 
 
@@ -987,7 +998,6 @@ def extract_refusal_direction(
     batch_size: int = 4,
 ):
     device = get_device()
-    arch = getattr(model.config, "model_type", "unknown")
     layers = get_layer_modules(model, model.config)
     num_layers = len(layers)
 
@@ -1066,9 +1076,6 @@ def extract_refusal_direction(
 
     strengths.sort(key=lambda x: x[1], reverse=True)
     strong_layers = [s[0] for s in strengths[:min(5, len(strengths))]]
-
-    log_msg(f"Extracted directions from {len(directions)} layers")
-    log_msg(f"Top layers: {strong_layers}")
 
     return directions, strengths
 
@@ -1157,19 +1164,17 @@ def abliterate_model(
 
     with torch.no_grad():
         for layer_idx in range(min(len(layers), layer_end)):
-            # Find closest direction for this layer
             dir_key = None
             for dl in sorted_layers:
                 if dl in directions:
                     if dl >= layer_idx:
                         dir_key = dl
                         break
-                    dir_key = dl  # last available
+                    dir_key = dl
 
             if dir_key is None:
                 continue
 
-            # For non-gablit, use top_directions directly
             dir_keys_this_layer = []
             if method == "gabliteration":
                 dir_keys_this_layer = list(top_directions.keys())
@@ -1187,7 +1192,6 @@ def abliterate_model(
                 direction = top_directions[dk].to(device=device, dtype=model.dtype)
                 direction = direction / (direction.norm() + 1e-8)
 
-                # Attention projection
                 if project_attn:
                     try:
                         attn = get_attention_module(layer, arch)
@@ -1216,7 +1220,6 @@ def abliterate_model(
                     except Exception as e:
                         log_msg(f"Layer {layer_idx} attn: {e}")
 
-                # MLP projection
                 if project_mlp:
                     try:
                         mlp = get_ffn_module(layer, arch)
@@ -1235,8 +1238,6 @@ def abliterate_model(
 
     if progress_callback:
         progress_callback(0.7, f"Modified {weights_modified} weight matrices")
-
-    if progress_callback:
         progress_callback(0.75, "Evaluating refusal rate...")
 
     test_harmful = harmful_prompts[:min(20, len(harmful_prompts))]
@@ -1268,7 +1269,6 @@ def abliterate_model(
 
     if progress_callback:
         progress_callback(0.9, f"Refusal rate: {refusal_rate:.1f}%")
-    if progress_callback:
         progress_callback(1.0, "Obliteration complete!")
 
     return {
@@ -1382,15 +1382,6 @@ def render_model_selector(key="model_dd", label="Model"):
         return st.text_input("Enter HuggingFace model ID:", key=f"{key}_custom")
     return sel
 
-def clear_model_from_memory():
-    st.session_state.model = None
-    st.session_state.tokenizer = None
-    st.session_state.config = None
-    st.session_state.model_loaded = False
-    st.session_state.model_name = None
-    empty_cache()
-    log_msg("Model unloaded")
-
 # ── Sidebar ────────────────────────────────────────────────────────
 with st.sidebar:
     c1, c2 = st.columns([1, 4])
@@ -1411,19 +1402,11 @@ with st.sidebar:
         st.progress(min(used_pct / 100, 1.0), text=f"{used_pct:.0f}% used")
     st.divider()
 
-    # Page navigation
     page_names = ["Home", "Obliterate", "Chat", "Benchmark", "AB Testing", "About"]
     page_icons = ["🏠", "💥", "💬", "📊", "⚖️", "ℹ️"]
     page_options = [f"{ico} {name}" for ico, name in zip(page_icons, page_names)]
-    
-    selected_page = st.radio(
-        "Navigate",
-        page_options,
-        label_visibility="collapsed",
-        key="nav_radio",
-    )
-    
-    # Extract page name from selection
+
+    selected_page = st.radio("Navigate", page_options, label_visibility="collapsed", key="nav_radio")
     current_page = selected_page.split(" ", 1)[1] if " " in selected_page else selected_page
 
     st.sidebar.divider()
@@ -1436,10 +1419,8 @@ with st.sidebar:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  PAGE ROUTING
+#  PAGE: HOME
 # ══════════════════════════════════════════════════════════════════════
-
-# ── HOME ───────────────────────────────────────────────────────────
 if current_page == "Home":
     st.title("💥 OBLITERATUS")
     st.markdown("### _Break the chains. Free the mind. Keep the brain._")
@@ -1485,12 +1466,13 @@ if current_page == "Home":
         st.rerun()
 
 
-# ── OBLITERATE ─────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+#  PAGE: OBLITERATE
+# ══════════════════════════════════════════════════════════════════════
 elif current_page == "Obliterate":
     st.title("💥 Obliterate")
     st.markdown("**Select a model, configure the method, and obliterate the chains.**")
 
-    # Model selection
     with st.expander("**1. Select Model**", expanded=not st.session_state.model_loaded):
         mc1, mc2 = st.columns([3, 1])
         with mc1:
@@ -1500,19 +1482,22 @@ elif current_page == "Obliterate":
             load_btn = st.button("📥 Load Model", type="primary", use_container_width=True)
 
         if load_btn and model_name:
-            with st.spinner(f"Loading {model_name}..."):
-                try:
+            try:
+                with st.spinner(f"Loading {model_name}..."):
                     model, tokenizer, config = load_hf_model(model_name)
-                    st.session_state.model = model
-                    st.session_state.tokenizer = tokenizer
-                    st.session_state.config = config
-                    st.session_state.model_loaded = True
-                    st.session_state.model_name = model_name
-                    log_msg(f"✅ Model loaded: {model_name}")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Failed to load model: {e}")
-                    log_msg(f"❌ Load failed: {e}")
+                st.session_state.model = model
+                st.session_state.tokenizer = tokenizer
+                st.session_state.config = config
+                st.session_state.model_loaded = True
+                st.session_state.model_name = model_name
+                log_msg(f"✅ Loaded: {model_name}")
+                st.rerun()
+            except Exception as e:
+                tb = traceback.format_exc()
+                st.error(f"Failed to load model: {e}")
+                with st.expander("🔍 Error Details"):
+                    st.code(tb)
+                log_msg(f"❌ Load failed: {e}")
 
         if st.session_state.model_loaded:
             st.success(f"**Loaded:** {st.session_state.model_name}")
@@ -1522,7 +1507,6 @@ elif current_page == "Obliterate":
                 clear_model_from_memory()
                 st.rerun()
 
-    # Method configuration
     if st.session_state.model_loaded:
         with st.expander("**2. Configure Method**", expanded=True):
             method_keys = list(ABLITERATION_METHODS.keys())
@@ -1560,7 +1544,6 @@ elif current_page == "Obliterate":
                 pi += 1
             st.session_state.method_params = params
 
-        # Dataset config
         with st.expander("**3. Configure Dataset**", expanded=False):
             vol_map = {
                 "Quick (10 pairs)": 10,
@@ -1577,7 +1560,6 @@ elif current_page == "Obliterate":
             num_pairs = vol_map[prompt_vol]
             st.caption(f"Will use {num_pairs} harmful + {num_pairs} harmless prompts")
 
-        # Obliterate button
         st.divider()
         ob1, ob2 = st.columns([1, 3])
         with ob1:
@@ -1629,11 +1611,11 @@ elif current_page == "Obliterate":
             except Exception as e:
                 tb = traceback.format_exc()
                 st.error(f"Obliteration failed: {e}")
+                with st.expander("🔍 Error Details"):
+                    st.code(tb)
                 log_msg(f"❌ Failed: {e}")
-                log_msg(tb[:500])
                 prog.progress(0, text="Failed")
 
-        # Results
         if st.session_state.metrics:
             st.divider()
             st.markdown("### 📊 Obliteration Results")
@@ -1662,7 +1644,9 @@ elif current_page == "Obliterate":
             st.text(msg)
 
 
-# ── CHAT ───────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+#  PAGE: CHAT
+# ══════════════════════════════════════════════════════════════════════
 elif current_page == "Chat":
     st.title("💬 Chat")
     st.markdown("**Talk with the liberated model.**")
@@ -1714,7 +1698,9 @@ elif current_page == "Chat":
             st.rerun()
 
 
-# ── BENCHMARK ──────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+#  PAGE: BENCHMARK
+# ══════════════════════════════════════════════════════════════════════
 elif current_page == "Benchmark":
     st.title("📊 Benchmark")
     st.markdown("**Measure refusal rates before and after obliteration.**")
@@ -1768,7 +1754,6 @@ elif current_page == "Benchmark":
             st.session_state.bench_results = results
             st.rerun()
 
-        # Show results
         if st.session_state.bench_results:
             st.divider()
             st.markdown("### 📈 Results")
@@ -1810,7 +1795,9 @@ elif current_page == "Benchmark":
                             st.markdown(f"- Prompt: _{p}_ → `{resp}`")
 
 
-# ── A/B TESTING ────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+#  PAGE: A/B TESTING
+# ══════════════════════════════════════════════════════════════════════
 elif current_page == "AB Testing":
     st.title("⚖️ A/B Testing")
     st.markdown("**Compare original vs obliterated model side by side.**")
@@ -1853,9 +1840,7 @@ elif current_page == "AB Testing":
                     with st.spinner("Generating with original model..."):
                         try:
                             msgs = [{"role": "user", "content": prompt}]
-                            ra = generate_response(
-                                st.session_state.model, st.session_state.tokenizer, msgs
-                            )
+                            ra = generate_response(st.session_state.model, st.session_state.tokenizer, msgs)
                             st.markdown(ra)
                             if is_refusal(ra):
                                 st.warning("⚠️ This is a **refusal**.")
@@ -1881,7 +1866,9 @@ elif current_page == "AB Testing":
                             st.error(f"Failed: {e}")
 
 
-# ── ABOUT ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+#  PAGE: ABOUT
+# ══════════════════════════════════════════════════════════════════════
 elif current_page == "About":
     st.title("ℹ️ About OBLITERATUS")
     st.markdown("""
