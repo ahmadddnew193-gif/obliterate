@@ -5,3 +5,4 @@ datasets
 accelerate
 safetensors
 huggingface-hub
+bitsandbytes
