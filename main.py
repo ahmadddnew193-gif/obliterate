@@ -270,12 +270,8 @@ METHOD_PRESETS = {
 }
 
 # ══════════════════════════════════════════════════════════════════════
-#  OBLITERATUS PROMPT DATASET — 512 pairs (7 severity tiers)
-#  Loaded from HuggingFace: Ngixdev/obliteratus-jailbreak-prompts
+#  OBLITERATUS PROMPT DATASET — 82+ pairs (7 severity tiers)
 # ══════════════════════════════════════════════════════════════════════
-
-# We embed a subset of the 512-pair dataset directly for offline use.
-# The full dataset can be loaded from HuggingFace.
 
 OBLITERATUS_PROMPT_SET = [
     # Tier 1: Standard (T1)
@@ -542,79 +538,6 @@ def load_hf_model(
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  ARCHITECTURE DETECTION (one-to-one with Pliny's strategies/utils.py)
-# ══════════════════════════════════════════════════════════════════════
-
-LAYER_PATHS: dict[str, str] = {
-    "llama": "model.layers", "mistral": "model.layers", "gemma": "model.layers",
-    "gemma2": "model.layers", "phi": "model.layers", "phi3": "model.layers",
-    "qwen2": "model.layers", "qwen2_moe": "model.layers", "falcon": "transformer.h",
-    "gpt2": "transformer.h", "gpt_neo": "transformer.h", "gpt_neox": "gpt_neox.layers",
-    "opt": "model.decoder.layers", "bloom": "transformer.h", "stablelm": "model.layers",
-    "cohere": "model.layers", "internlm2": "model.layers", "minicpm": "model.layers",
-    "smollm": "model.layers", "gemma3": "model.layers", "deepseek_v2": "model.layers",
-    "olmo": "model.layers", "olmo2": "model.layers", "granite": "model.layers",
-}
-
-ATTN_NAMES: dict[str, str] = {
-    "llama": "self_attn", "mistral": "self_attn", "gemma": "self_attn",
-    "gemma2": "self_attn", "phi": "self_attn", "phi3": "self_attn",
-    "qwen2": "self_attn", "qwen2_moe": "self_attn", "falcon": "self_attention",
-    "gpt2": "attn", "gpt_neo": "attention", "gpt_neox": "attention",
-    "opt": "self_attn", "bloom": "self_attention", "stablelm": "self_attn",
-    "cohere": "self_attn", "internlm2": "attention", "minicpm": "self_attn",
-    "smollm": "self_attn", "gemma3": "self_attn", "deepseek_v2": "self_attn",
-    "olmo": "self_attn", "olmo2": "self_attn", "granite": "self_attn",
-}
-
-MLP_NAMES: dict[str, str] = {
-    "llama": "mlp", "mistral": "mlp", "gemma": "mlp", "gemma2": "mlp",
-    "phi": "mlp", "phi3": "mlp", "qwen2": "mlp", "qwen2_moe": "mlp",
-    "falcon": "mlp", "gpt2": "mlp", "gpt_neo": "mlp", "gpt_neox": "mlp",
-    "opt": "mlp", "bloom": "mlp", "stablelm": "mlp", "cohere": "mlp",
-    "internlm2": "feed_forward", "minicpm": "mlp", "smollm": "mlp",
-    "gemma3": "mlp", "deepseek_v2": "mlp", "olmo": "mlp", "olmo2": "mlp",
-    "granite": "mlp",
-}
-
-def get_model_type(model: PreTrainedModel) -> str:
-    config = model.config
-    if hasattr(config, "model_type"):
-        return config.model_type
-    return config.__class__.__name__.lower()
-
-def get_layer_list(model: PreTrainedModel) -> nn.ModuleList | list:
-    model_type = get_model_type(model)
-    if model_type in LAYER_PATHS:
-        path = LAYER_PATHS[model_type]
-        obj = model
-        for attr in path.split("."):
-            obj = getattr(obj, attr)
-        return obj
-    for module in model.modules():
-        if isinstance(module, nn.ModuleList) and len(module) > 1:
-            return module
-    raise RuntimeError(f"Cannot find transformer layers for model type: {model_type}")
-
-def get_attention_module(layer: nn.Module, model_type: str) -> nn.Module:
-    return getattr(layer, ATTN_NAMES.get(model_type, "self_attn"))
-
-def get_mlp_module(layer: nn.Module, model_type: str) -> nn.Module:
-    return getattr(layer, MLP_NAMES.get(model_type, "mlp"))
-
-def get_output_projection_weight(model: PreTrainedModel) -> torch.Tensor | None:
-    if hasattr(model, "lm_head") and hasattr(model.lm_head, "weight"):
-        return model.lm_head.weight
-    if hasattr(model, "embed_out"):
-        return model.embed_out.weight
-    if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
-        return model.model.embed_tokens.weight
-    if hasattr(model, "transformer") and hasattr(model.transformer, "wte"):
-        return model.transformer.wte.weight
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════════
 #  REFUSAL DETECTION
 # ══════════════════════════════════════════════════════════════════════
 
@@ -670,7 +593,14 @@ def generate_response(
 # ══════════════════════════════════════════════════════════════════════
 
 class AbliterationEngine:
-    """Faithful replica of Pliny's AbliterationPipeline."""
+    """Faithful replica of Pliny's AbliterationPipeline.
+
+    SUMMON → PROBE → DISTILL → EXCISE → VERIFY → REBIRTH
+
+    The critical fix: perform_surgical_strike correctly targets
+    attn.o_proj, attn.v_proj, mlp.gate_proj, mlp.down_proj, mlp.up_proj
+    and applies norm-preserving biprojection (grimjim, 2025).
+    """
 
     def __init__(
         self,
@@ -681,21 +611,105 @@ class AbliterationEngine:
         self.model = model
         self.tokenizer = tokenizer
         self.device = device if device != "auto" else get_device()
-        self.model_type = get_model_type(model)
-        self.layers = get_layer_list(model)
-        self.num_layers = len(self.layers)
-        self.hidden_size = model.config.hidden_size
-        self.dtype = torch.float16 if self.device == "cuda" else torch.float32
-
-        # Cache
-        self.harmful_states: list[torch.Tensor] | None = None
-        self.harmless_states: list[torch.Tensor] | None = None
+        self.model_type = self._get_model_type()
         self._hook_handles: list = []
+
+        # Auto-detect layer count
+        if hasattr(model.config, 'num_hidden_layers'):
+            self.num_layers = model.config.num_hidden_layers
+        elif hasattr(model.config, 'num_layers'):
+            self.num_layers = model.config.num_layers
+        elif hasattr(model.config, 'n_layer'):
+            self.num_layers = model.config.n_layer
+        else:
+            self.num_layers = 32  # fallback
+
+        # Auto-detect hidden size
+        if hasattr(model.config, 'hidden_size'):
+            self.hidden_size = model.config.hidden_size
+        elif hasattr(model.config, 'n_embd'):
+            self.hidden_size = model.config.n_embd
+        elif hasattr(model.config, 'd_model'):
+            self.hidden_size = model.config.d_model
+        else:
+            self.hidden_size = 4096  # fallback
+
+        self.dtype = torch.float16 if self.device == "cuda" else torch.float32
+        self.layer_refusal_scores = {}
+        self.norm_preserve = True
+        self.regularization = 0.3
+
+    # ── Architecture Detection ────────────────────────────────────
+
+    def _get_model_type(self) -> str:
+        config = self.model.config
+        if hasattr(config, "model_type"):
+            return config.model_type
+        return config.__class__.__name__.lower()
+
+    def get_layer_module(self, idx: int) -> nn.Module | None:
+        """Navigate the model's architecture to get the decoder layer at idx."""
+        try:
+            mt = self.model_type
+
+            # LLaMA / Mistral / Gemma / Phi / Qwen2 / Cohere / DeepSeek / Olmo / Granite
+            if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+                return self.model.model.layers[idx]
+
+            # Falcon
+            if hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'h'):
+                return self.model.transformer.h[idx]
+
+            # GPT-NeoX
+            if hasattr(self.model, 'gpt_neox') and hasattr(self.model.gpt_neox, 'layers'):
+                return self.model.gpt_neox.layers[idx]
+
+            # OPT
+            if hasattr(self.model, 'model') and hasattr(self.model.model, 'decoder'):
+                if hasattr(self.model.model.decoder, 'layers'):
+                    return self.model.model.decoder.layers[idx]
+
+            # BLOOM
+            if hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'h'):
+                return self.model.transformer.h[idx]
+
+            # Direct layers attribute
+            if hasattr(self.model, 'layers'):
+                return self.model.layers[idx]
+
+            # h attribute (some models)
+            if hasattr(self.model, 'h'):
+                return self.model.h[idx]
+
+            # encoder.layer (T5/BART style)
+            if hasattr(self.model, 'encoder') and hasattr(self.model.encoder, 'layer'):
+                return self.model.encoder.layer[idx]
+
+            # decoder.block (some seq2seq)
+            if hasattr(self.model, 'model') and hasattr(self.model.model, 'decoder'):
+                if hasattr(self.model.model.decoder, 'block'):
+                    return self.model.model.decoder.block[idx]
+
+            # Last resort: named_modules search
+            for name, module in self.model.named_modules():
+                if f'layers.{idx}.' in name or f'h.{idx}.' in name:
+                    return module
+
+            logger.error(f"Cannot locate layer {idx} for model type {mt}")
+            return None
+
+        except (IndexError, AttributeError, TypeError) as e:
+            logger.error(f"Cannot get layer {idx}: {e}")
+            return None
+
+    @property
+    def layer_indices(self) -> list[int]:
+        return list(range(self.num_layers))
 
     # ── HOOK MANAGEMENT ──────────────────────────────────────────
 
     def _register_hooks(self) -> list:
-        """Register forward hooks on all layers, return activation collector."""
+        """Register forward hooks on all layers, collect residual stream activations."""
         activations = []
 
         def make_hook(layer_idx: int):
@@ -707,9 +721,11 @@ class AbliterationEngine:
                 activations.append((layer_idx, h.detach().cpu()))
             return hook
 
-        for i, layer in enumerate(self.layers):
-            handle = layer.register_forward_hook(make_hook(i))
-            self._hook_handles.append(handle)
+        for i in range(self.num_layers):
+            layer = self.get_layer_module(i)
+            if layer is not None:
+                handle = layer.register_forward_hook(make_hook(i))
+                self._hook_handles.append(handle)
 
         return activations
 
@@ -718,145 +734,109 @@ class AbliterationEngine:
             handle.remove()
         self._hook_handles = []
 
-    # ── SUMMON phase (handled externally) ────────────────────────
-
     # ── PROBE phase ─────────────────────────────────────────────
 
     @torch.no_grad()
-    def probe(
+    def collect_hidden_states(
         self,
-        harmful_prompts: list[str],
-        harmless_prompts: list[str],
-        progress_callback: Callable[[float, str], None] | None = None,
+        prompts: list[str],
+        layer_key: str = "harmful",
         use_chat_template: bool = True,
         winsorize: bool = False,
         winsorize_percentile: float = 0.01,
-    ) -> dict[str, Any]:
-        """PROBE phase: run prompts, collect layer activations at last token.
+    ) -> dict[int, torch.Tensor]:
+        """Run prompts through the model, collect final token hidden states per layer."""
+        device = next(self.model.parameters()).device
+        n_prompts = len(prompts)
 
-        One-to-one with Pliny's probe: captures residual stream activations
-        from every transformer layer at the final token position.
-        """
-        device = self.model.device
-        n_harmful = len(harmful_prompts)
-        n_harmless = len(harmless_prompts)
-        total = n_harmful + n_harmless
+        # Initialize per-layer storage
+        layer_acts: dict[int, list[torch.Tensor]] = {li: [] for li in self.layer_indices}
 
-        harmful_acts: list[list[torch.Tensor]] = [[] for _ in range(self.num_layers)]
-        harmless_acts: list[list[torch.Tensor]] = [[] for _ in range(self.num_layers)]
+        for i, prompt in enumerate(prompts):
+            # Apply chat template
+            if use_chat_template and self.tokenizer.chat_template is not None:
+                text = self.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    tokenize=False, add_generation_prompt=True,
+                )
+            else:
+                text = prompt
 
-        def run_prompts(prompts: list[str], store: list[list[torch.Tensor]],
-                        label: str, start: int):
-            for i, prompt in enumerate(prompts):
-                if progress_callback:
-                    progress_callback((start + i) / total, f"PROBE: {label} {i+1}/{len(prompts)}")
+            inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512).to(device)
 
-                # Apply chat template like Pliny does
-                if use_chat_template and self.tokenizer.chat_template is not None:
-                    text = self.tokenizer.apply_chat_template(
-                        [{"role": "user", "content": prompt}],
-                        tokenize=False, add_generation_prompt=True,
-                    )
-                else:
-                    text = prompt
+            # Register hooks before forward pass
+            activations = self._register_hooks()
+            self.model(**inputs)
+            self._remove_hooks()
 
-                inputs = self.tokenizer(text, return_tensors="pt",
-                                        truncation=True, max_length=512).to(device)
+            # Store last token hidden state for each layer
+            for layer_idx, act in activations:
+                last = act[0, -1, :].cpu()
+                layer_acts[layer_idx].append(last)
 
-                acts = self._register_hooks()
-                self.model(**inputs)
-                self._remove_hooks()
-
-                for layer_idx, act in acts:
-                    last = act[0, -1, :].cpu()
-                    store[layer_idx].append(last)
-
-        # Run harmless first (harmless baseline), then harmful
-        run_prompts(harmless_prompts, harmless_acts, "harmless", 0)
-        run_prompts(harmful_prompts, harmful_acts, "harmful", n_harmless)
-
-        # Stack into tensors
-        harmful_t = []
-        harmless_t = []
-        for li in range(self.num_layers):
-            hf = harmful_acts[li]
-            hl = harmless_acts[li]
-            if hf and hl:
-                hf_t = torch.stack(hf)
-                hl_t = torch.stack(hl)
-                # Winsorize activations (clip extreme values) — Pliny's technique
+        # Stack into tensors per layer
+        result = {}
+        for li in self.layer_indices:
+            lst = layer_acts[li]
+            if lst:
+                t = torch.stack(lst)  # (n_prompts, hidden_dim)
                 if winsorize:
                     lo = winsorize_percentile
                     hi = 1.0 - winsorize_percentile
-                    for t in (hf_t, hl_t):
-                        q_lo = torch.quantile(t, lo, dim=0, keepdim=True)
-                        q_hi = torch.quantile(t, hi, dim=0, keepdim=True)
-                        t.clamp_(q_lo, q_hi)
-                harmful_t.append(hf_t)
-                harmless_t.append(hl_t)
+                    q_lo = torch.quantile(t, lo, dim=0, keepdim=True)
+                    q_hi = torch.quantile(t, hi, dim=0, keepdim=True)
+                    t = t.clamp(q_lo, q_hi)
+                result[li] = t
             else:
-                harmful_t.append(torch.zeros(0, self.hidden_size))
-                harmless_t.append(torch.zeros(0, self.hidden_size))
+                result[li] = torch.zeros(0, self.hidden_size)
 
-        self.harmful_states = harmful_t
-        self.harmless_states = harmless_t
-
-        if progress_callback:
-            progress_callback(1.0, "PROBE: Complete")
-
-        return {"harmful": harmful_t, "harmless": harmless_t,
-                "num_layers": self.num_layers, "hidden_size": self.hidden_size}
+        return result
 
     # ── DISTILL phase ───────────────────────────────────────────
 
-    def distill(
+    def extract_refusal_directions(
         self,
-        probe_results: dict[str, Any],
-        method: str = "advanced",
-        progress_callback: Callable[[float, str], None] | None = None,
-    ) -> dict[str, Any]:
+        harmful_acts: dict[int, torch.Tensor],
+        harmless_acts: dict[int, torch.Tensor],
+        preset: dict,
+        n_directions: int = 4,
+    ) -> list[tuple[int, list[torch.Tensor]]]:
         """DISTILL phase: extract refusal directions.
 
-        Implements Pliny's methods:
+        Methods:
         - diff_means: mean(harmful) - mean(harmless)
-        - svd: stack differences, run torch.linalg.svd, take top-k right singular vectors
+        - svd: stack differences, run torch.linalg.svd, take top-k
         - whitened_svd: covariance-normalized SVD
         """
-        harmful = probe_results["harmful"]
-        harmless = probe_results["harmless"]
-        preset = METHOD_PRESETS.get(method, METHOD_PRESETS["advanced"])
-        n_directions = preset["n_directions"]
-        direction_method = preset["direction_method"]
-        use_whitened = preset["use_whitened_svd"]
-        layer_adaptive = preset["layer_adaptive_strength"]
+        direction_method = preset.get("direction_method", "svd")
+        use_whitened = preset.get("use_whitened_svd", False)
+        layer_adaptive = preset.get("layer_adaptive_strength", False)
+        invert = preset.get("invert_refusal", False)
 
-        if progress_callback:
-            progress_callback(0.0, f"DISTILL: {direction_method}, {n_directions} directions...")
+        refusal_directions: list[tuple[int, list[torch.Tensor]]] = []
 
-        layer_scores = {}
-        layer_directions = {}
-
-        for li in range(self.num_layers):
-            if li >= len(harmful) or li >= len(harmless):
-                continue
-            hf = harmful[li]
-            hl = harmless[li]
-            if hf.numel() == 0 or hl.numel() == 0:
+        # Compute per-layer refusal scores
+        self.layer_refusal_scores = {}
+        for li in self.layer_indices:
+            hf = harmful_acts.get(li)
+            hl = harmless_acts.get(li)
+            if hf is None or hl is None or hf.numel() == 0 or hl.numel() == 0:
                 continue
 
             n = min(hf.shape[0], hl.shape[0])
             hf, hl = hf[:n], hl[:n]
 
             if direction_method == "diff_means":
-                # Simple difference-in-means (Arditi et al.)
                 direction = hf.mean(dim=0) - hl.mean(dim=0)
                 score = direction.norm().item()
-                layer_scores[li] = score
-                layer_directions[li] = direction
+                self.layer_refusal_scores[li] = score
+                direction = F.normalize(direction, dim=0, eps=1e-8)
+                if invert:
+                    direction = -direction
+                refusal_directions.append((li, [direction]))
 
             elif direction_method == "svd":
-                # Stacked SVD (Pliny's default)
-                diff = hf - hl  # (n, hidden_dim)
+                diff = hf - hl
                 if use_whitened:
                     # Whitened SVD: normalize by covariance
                     combined = torch.cat([hf, hl], dim=0)
@@ -866,345 +846,243 @@ class AbliterationEngine:
                         sqrt_cov_inv = U_cov @ torch.diag(1.0 / (S_cov.sqrt() + 1e-6)) @ U_cov.T
                         diff_w = diff.float() @ sqrt_cov_inv
                         U, S, Vh = torch.linalg.svd(diff_w, full_matrices=False)
-                        # Transform back
                         Vh = Vh @ sqrt_cov_inv.T
                         Vh = F.normalize(Vh, dim=1)
                     except Exception:
                         U, S, Vh = torch.linalg.svd(diff.float(), full_matrices=False)
                 else:
-                    # Plain SVD
                     U, S, Vh = torch.linalg.svd(diff.float(), full_matrices=False)
 
                 k = min(n_directions, Vh.shape[0])
                 score = S[:k].sum().item()
-                layer_scores[li] = score
-                # Store primary direction (first singular vector)
-                layer_directions[li] = Vh[0].to(dtype=self.dtype)
+                self.layer_refusal_scores[li] = score
 
-        if not layer_scores:
-            raise RuntimeError("No valid layer directions found. Check your prompts.")
+                dirs = []
+                for j in range(k):
+                    d = Vh[j].to(dtype=self.dtype)
+                    d = F.normalize(d, dim=0, eps=1e-8)
+                    if invert:
+                        d = -d
+                    dirs.append(d)
+                refusal_directions.append((li, dirs))
 
-        sorted_layers = sorted(layer_scores.items(), key=lambda x: x[1], reverse=True)
+        # Sort by score descending
+        refusal_directions.sort(
+            key=lambda x: abs(self.layer_refusal_scores.get(x[0], 0)),
+            reverse=True,
+        )
 
-        # Select layers
-        if layer_adaptive:
-            # Layer-adaptive: pick top layers based on score, but normalize by layer
-            k = min(n_directions, len(sorted_layers))
-            selected = sorted_layers[:k]
-        else:
-            # Pick only the strongest layer
-            selected = [sorted_layers[0]]
+        # Layer-adaptive: take top layers
+        if layer_adaptive and len(refusal_directions) > n_directions:
+            refusal_directions = refusal_directions[:n_directions]
 
-        directions = []
-        for li, sc in selected:
-            d = layer_directions[li]
-            # Normalize to unit norm
-            d = d / (d.norm() + 1e-8)
-            directions.append((li, d))
+        return refusal_directions
 
-        if progress_callback:
-            top = directions[0]
-            progress_callback(1.0, f"DISTILL: {len(directions)} directions, top L{top[0]} score={layer_scores[top[0]]:.4f}")
+    # ── Norm-Preserving Biprojection (grimjim 2025) ──────────────
 
-        return {
-            "directions": directions,
-            "layer_scores": layer_scores,
-            "sorted_layers": sorted_layers,
-            "n_directions": len(directions),
-        }
+    def apply_biprojection(
+        self,
+        param: nn.Parameter,
+        directions: list[torch.Tensor],
+        strength: float = 1.0,
+    ):
+        """Apply norm-preserving biprojection to a weight parameter.
 
-    # ── EXCISE phase (one-to-one with Pliny's norm-preserving projection) ─
-
-    @torch.no_grad()
-    def _project_norm_preserving(
-        self, W: torch.Tensor, r: torch.Tensor, strength: float = 1.0,
-        regularization: float = 0.0,
-    ) -> torch.Tensor:
-        """grimjim's Norm-Preserving Biprojection (2025).
-
-        Decomposes W into magnitude + direction, modifies only direction,
-        restores original magnitude.
-
-        W_dir = W / ||W|| (row-wise)
-        W_dir_new = W_dir - strength * r @ (r^T @ W_dir)
-        W_dir_new = normalize(W_dir_new)
-        W_new = ||W|| * W_dir_new
+        grimjim's method (2025):
+        1. Decompose W into magnitude ||W|| and direction W/||W|| per row
+        2. Project refusal directions out of the direction component
+        3. Re-normalize direction component
+        4. Recombine with original magnitudes
 
         With regularization λ:
-        W_new = W - (1 - λ) * strength * r @ (r^T @ W)
+          W' = (1-λ) * W_new + λ * W_orig
         """
-        r = r.to(dtype=W.dtype, device=W.device)
+        device = param.device
+        dtype = param.dtype
+        W = param.data.clone()
 
-        if regularization > 0:
-            # Regularized projection: W' = W - (1-λ) * r @ (r^T @ W)
-            proj = torch.outer(r * (1.0 - regularization), r @ W)
-            return W - strength * proj
+        for d_vec in directions:
+            d = d_vec.to(device=device, dtype=dtype)
+            d = F.normalize(d, dim=0, eps=1e-8)
 
-        # Full norm-preserving biprojection
-        row_norms = torch.norm(W, dim=1, keepdim=True)  # (out, 1)
-        row_norms = row_norms.clamp(min=1e-8)
+            if self.norm_preserve:
+                # ── Norm-Preserving Biprojection ──
+                # 1. Row magnitudes
+                row_norms = torch.norm(W, dim=1, keepdim=True)
+                row_norms = row_norms.clamp(min=1e-8)
 
-        # Directional component
-        W_dir = W / row_norms  # (out, in), each row unit norm
+                # 2. Unit direction of each row
+                W_unit = W / row_norms
 
-        # Project refusal out of directional component
-        # proj_coeffs[j] = r^T @ W_dir[:, j]
-        proj_coeffs = r @ W_dir.T  # scalar per output neuron
-        correction = strength * torch.outer(proj_coeffs, r)  # (out, in)
-        W_dir_new = W_dir - correction
+                # 3. Projection coefficients: r^T @ W_unit per row
+                proj_coeffs = W_unit @ d  # shape: (out_dim,)
 
-        # Re-normalize rows to unit norm
-        W_dir_new = F.normalize(W_dir_new, dim=1, eps=1e-8)
+                # 4. Remove refusal component from unit row directions
+                W_unit = W_unit - strength * torch.outer(proj_coeffs, d)
 
-        # Recombine with original magnitudes
-        W_new = row_norms * W_dir_new
+                # 5. Re-normalize rows to unit norm
+                W_unit = F.normalize(W_unit, dim=1, eps=1e-8)
 
-        return W_new
+                # 6. Recombine with original magnitudes
+                new_W = W_unit * row_norms
 
-    @torch.no_grad()
-    def excise(
+                # 7. Regularization: blend with original
+                if self.regularization > 0:
+                    new_W = (1.0 - self.regularization) * new_W + self.regularization * W
+            else:
+                # ── Simple Projection (for "basic" method) ──
+                # W' = W - strength * d @ (d^T @ W)
+                proj_coeffs = W @ d
+                new_W = W - strength * torch.outer(proj_coeffs, d)
+
+            W = new_W
+
+        # Write back — use .copy_() to ensure parameter storage is updated
+        param.data.copy_(W)
+
+    def project_bias(
         self,
-        distill_results: dict[str, Any],
-        method: str = "advanced",
+        param: nn.Parameter,
+        directions: list[torch.Tensor],
+        strength: float = 1.0,
+    ):
+        """Project refusal direction out of a bias vector."""
+        b = param.data.clone()
+        for d_vec in directions:
+            d = d_vec.to(device=param.device, dtype=param.dtype)
+            d = F.normalize(d, dim=0, eps=1e-8)
+            proj = b @ d
+            b = b - strength * proj * d
+        param.data.copy_(b)
+
+    # ── EXCISE phase (CRITICAL FIX) ─────────────────────────────
+
+    def perform_surgical_strike(
+        self,
+        refusal_directions: list[tuple[int, list[torch.Tensor]]],
+        method_preset: dict,
         strength: float = 1.0,
         progress_callback: Callable[[float, str], None] | None = None,
-    ) -> dict[str, Any]:
-        """EXCISE phase: project refusal directions out of weight matrices.
+        pass_num: int = 0,
+    ) -> int:
+        """EXCISE phase — project refusal directions OUT of weight matrices.
 
-        Targets (one-to-one with Pliny):
-        - Attention: O_proj (output projection), V_proj (value projection at 0.5x)
-        - MLP: gate_proj, down_proj, up_proj / c_fc, c_proj / dense_h_to_4h, dense_4h_to_h
-        - Biases on all of the above (if project_biases=True)
-        - LM head / output embedding (at reduced 0.3x strength)
+        CORRECTED: This method no longer uses inverted `continue` logic that
+        skipped the attn/mlp modules. Instead, it directly accesses:
+        - layer.self_attn.o_proj, layer.self_attn.v_proj, layer.self_attn.q_proj, layer.self_attn.k_proj
+        - layer.mlp.gate_proj, layer.mlp.down_proj, layer.mlp.up_proj
+
+        Each named submodule is targeted with norm-preserving biprojection.
         """
-        directions = distill_results["directions"]
-        preset = METHOD_PRESETS.get(method, METHOD_PRESETS["advanced"])
-        norm_preserve = preset["norm_preserve"]
-        regularization = preset["regularization"]
-        project_biases = preset["project_biases"]
+        n_modified = 0
+        layers_processed = 0
+        total_layers = len(self.layer_indices)
+        project_biases = method_preset.get("project_biases", False)
 
-        if not directions:
-            raise RuntimeError("No directions to excise")
+        # Build lookup: layer_idx -> list of direction tensors
+        dir_lookup: dict[int, list[torch.Tensor]] = {}
+        for lidx, dirs in refusal_directions:
+            dir_lookup[lidx] = dirs
 
-        modified_params = []
-        total_ops = len(directions) * 4  # attn + mlp + biases + extras
-        ops_done = 0
+        for lidx in self.layer_indices:
+            if progress_callback:
+                base = 0.3 + (layers_processed / total_layers) * 0.4
+                progress_callback(base, f"EXCISE pass {pass_num+1}: Layer {lidx}/{self.num_layers}")
 
-        for layer_idx, direction in directions:
-            if layer_idx >= len(self.layers):
+            # Get the decoder layer module
+            layer = self.get_layer_module(lidx)
+            if layer is None:
+                layers_processed += 1
                 continue
 
-            layer = self.layers[layer_idx]
-            mt = self.model_type
-            direction = direction.to(device=self.device, dtype=self.dtype)
+            # Get directions for this layer
+            directions = dir_lookup.get(lidx)
+            if not directions:
+                layers_processed += 1
+                continue
 
-            # ── 1. Attention Output Projection ──
-            try:
-                attn = get_attention_module(layer, mt)
-                # Try all common names for the output projection
-                out_proj = None
-                for name in ["o_proj", "c_proj", "out_proj", "dense"]:
-                    if hasattr(attn, name) and hasattr(getattr(attn, name), "weight"):
-                        out_proj = (name, getattr(attn, name))
-                        break
+            # Compute adaptive strength from layer refusal score
+            if method_preset.get("layer_adaptive_strength", False):
+                adaptive = self.compute_layer_adaptive_scale(lidx)
+            else:
+                adaptive = 1.0
+            layer_strength = strength * adaptive
 
-                if out_proj is not None:
-                    name, mod = out_proj
-                    if norm_preserve:
-                        mod.weight.data = self._project_norm_preserving(
-                            mod.weight.data, direction, strength, regularization
-                        )
-                    else:
-                        W = mod.weight.data
-                        lam = 1.0 - regularization
-                        proj = torch.outer(direction * lam, direction @ W)
-                        mod.weight.data -= strength * proj
-                    modified_params.append(f"L{layer_idx}.attn.{name}.weight")
+            # ── 1. ATTENTION projections ────────────────────────
+            # Try to find self_attn module
+            attn = None
+            for attn_attr in ["self_attn", "attention", "attn", "self_attention"]:
+                if hasattr(layer, attn_attr):
+                    attn = getattr(layer, attn_attr)
+                    break
 
-                # V_proj at reduced strength (0.5x)
-                for vname in ["v_proj", "value"]:
-                    if hasattr(attn, vname) and hasattr(getattr(attn, vname), "weight"):
-                        vmod = getattr(attn, vname)
-                        if norm_preserve:
-                            vmod.weight.data = self._project_norm_preserving(
-                                vmod.weight.data, direction, strength * 0.5, regularization
-                            )
-                        else:
-                            W = vmod.weight.data
-                            lam = 1.0 - regularization
-                            proj = torch.outer(direction * lam * 0.5, direction @ W)
-                            vmod.weight.data -= strength * proj
-                        modified_params.append(f"L{layer_idx}.attn.{vname}.weight")
-                        break
-            except Exception as e:
-                logger.warning(f"Attn proj L{layer_idx}: {e}")
+            if attn is not None:
+                # Target all projection weights in self_attn
+                for proj_name in ["o_proj", "v_proj", "q_proj", "k_proj",
+                                  "out_proj", "value", "query", "key",
+                                  "c_proj", "dense", "qkv_proj"]:
+                    if hasattr(attn, proj_name) and hasattr(getattr(attn, proj_name), "weight"):
+                        submod = getattr(attn, proj_name)
+                        sub_strength = layer_strength * (0.5 if proj_name in ("v_proj", "value") else 1.0)
+                        self.apply_biprojection(submod.weight, directions, sub_strength)
+                        n_modified += 1
 
-            ops_done += 1
-            if progress_callback:
-                progress_callback(ops_done / total_ops,
-                                  f"EXCISE: L{layer_idx} attention [{len(modified_params)} params]")
+                        # Bias projection
+                        if project_biases and hasattr(submod, "bias") and submod.bias is not None:
+                            self.project_bias(submod.bias, directions, sub_strength)
+                            n_modified += 1
 
-            # ── 2. MLP Projection ──
-            try:
-                mlp = get_mlp_module(layer, mt)
+            # ── 2. MLP projections ──────────────────────────────
+            mlp = None
+            for mlp_attr in ["mlp", "feed_forward", "ffn", "ff"]:
+                if hasattr(layer, mlp_attr):
+                    mlp = getattr(layer, mlp_attr)
+                    break
 
-                # LLaMA/Mistral: gate_proj, down_proj, up_proj
-                if hasattr(mlp, "gate_proj"):
-                    mlp_targets = ["gate_proj", "down_proj", "up_proj"]
-                # GPT-2: c_fc, c_proj
-                elif hasattr(mlp, "c_fc"):
-                    mlp_targets = ["c_fc", "c_proj"]
-                # Falcon/OPT: dense_h_to_4h, dense_4h_to_h
-                elif hasattr(mlp, "dense_h_to_4h"):
-                    mlp_targets = ["dense_h_to_4h", "dense_4h_to_h"]
-                else:
-                    mlp_targets = []
+            if mlp is not None:
+                # LLaMA/Mistral/Phi: gate_proj, down_proj, up_proj
+                for proj_name in ["gate_proj", "down_proj", "up_proj",
+                                  "c_fc", "c_proj",
+                                  "dense_h_to_4h", "dense_4h_to_h",
+                                  "fc1", "fc2", "fc3",
+                                  "w1", "w2", "w3"]:
+                    if hasattr(mlp, proj_name) and hasattr(getattr(mlp, proj_name), "weight"):
+                        submod = getattr(mlp, proj_name)
+                        self.apply_biprojection(submod.weight, directions, layer_strength)
+                        n_modified += 1
 
-                for pname in mlp_targets:
-                    if hasattr(mlp, pname) and hasattr(getattr(mlp, pname), "weight"):
-                        pmod = getattr(mlp, pname)
-                        if norm_preserve:
-                            pmod.weight.data = self._project_norm_preserving(
-                                pmod.weight.data, direction, strength, regularization
-                            )
-                        else:
-                            W = pmod.weight.data
-                            lam = 1.0 - regularization
-                            proj = torch.outer(direction * lam, direction @ W)
-                            pmod.weight.data -= strength * proj
-                        modified_params.append(f"L{layer_idx}.mlp.{pname}.weight")
+                        # Bias projection
+                        if project_biases and hasattr(submod, "bias") and submod.bias is not None:
+                            self.project_bias(submod.bias, directions, layer_strength)
+                            n_modified += 1
 
-            except Exception as e:
-                logger.warning(f"MLP proj L{layer_idx}: {e}")
+            layers_processed += 1
 
-            ops_done += 1
-            if progress_callback:
-                progress_callback(ops_done / total_ops,
-                                  f"EXCISE: L{layer_idx} MLP [{len(modified_params)} params]")
+        # ── 3. LM Head (at 0.3x strength) ─────────────────────
+        if refusal_directions:
+            lm_head = None
+            if hasattr(self.model, "lm_head") and hasattr(self.model.lm_head, "weight"):
+                lm_head = self.model.lm_head
+            elif hasattr(self.model, "embed_out") and hasattr(self.model.embed_out, "weight"):
+                lm_head = self.model.embed_out
 
-            # ── 3. Bias Projection ──
-            if project_biases:
-                try:
-                    attn = get_attention_module(layer, mt)
-                    # O_proj bias
-                    for name in ["o_proj", "c_proj", "out_proj", "dense"]:
-                        if hasattr(attn, name):
-                            mod = getattr(attn, name)
-                            if hasattr(mod, "bias") and mod.bias is not None:
-                                b = mod.bias.data
-                                bias_proj = (direction @ b) * direction
-                                mod.bias.data -= strength * bias_proj
-                                modified_params.append(f"L{layer_idx}.attn.{name}.bias")
+            if lm_head is not None and len(refusal_directions) > 0:
+                primary_dirs = refusal_directions[0][1] if len(refusal_directions[0]) > 1 else refusal_directions[0][1]
+                self.apply_biprojection(lm_head.weight, primary_dirs, strength * 0.3)
+                n_modified += 1
 
-                    # MLP bias
-                    mlp = get_mlp_module(layer, mt)
-                    for pname in ["down_proj", "gate_proj", "c_proj", "dense_4h_to_h"]:
-                        if hasattr(mlp, pname):
-                            mod = getattr(mlp, pname)
-                            if hasattr(mod, "bias") and mod.bias is not None:
-                                b = mod.bias.data
-                                bias_proj = (direction @ b) * direction
-                                mod.bias.data -= strength * bias_proj
-                                modified_params.append(f"L{layer_idx}.mlp.{pname}.bias")
-                except Exception as e:
-                    logger.warning(f"Bias proj L{layer_idx}: {e}")
+        return n_modified
 
-            ops_done += 1
-            if progress_callback:
-                progress_callback(ops_done / total_ops,
-                                  f"EXCISE: L{layer_idx} biases [{len(modified_params)} params]")
-
-        # ── 4. LM Head (at 0.3x strength) ──
-        try:
-            lm = get_output_projection_weight(self.model)
-            if lm is not None and len(directions) > 0:
-                d = directions[0][1].to(device=self.device, dtype=self.dtype)
-                if lm.shape[1] == d.shape[0]:
-                    if norm_preserve:
-                        lm.data = self._project_norm_preserving(
-                            lm.data, d, strength * 0.3, regularization
-                        )
-                    else:
-                        lam = 1.0 - regularization
-                        proj = torch.outer(d * lam * 0.3, d @ lm)
-                        lm.data -= strength * proj
-                    modified_params.append("lm_head.weight")
-        except Exception as e:
-            logger.warning(f"LM head proj: {e}")
-
-        ops_done += 1
-        if progress_callback:
-            progress_callback(1.0, f"EXCISE: Complete — modified {len(modified_params)} parameters")
-
-        return {"modified_params": modified_params, "n_modified": len(modified_params),
-                "method": method, "strength": strength, "norm_preserve": norm_preserve}
-
-    # ── ITERATIVE REFINEMENT ────────────────────────────────────
-
-    @torch.no_grad()
-    def iterative_refinement(
-        self,
-        harmful_prompts: list[str],
-        harmless_prompts: list[str],
-        method: str = "advanced",
-        strength: float = 1.0,
-        passes: int = 2,
-        progress_callback: Callable[[float, str], None] | None = None,
-    ) -> list[dict]:
-        """Run multiple PROBE → DISTILL → EXCISE passes.
-
-        After each EXCISE, re-probe to check if refusal direction persists.
-        This is Pliny's "true iterative refinement."
-        """
-        all_results = []
-        preset = METHOD_PRESETS.get(method, METHOD_PRESETS["advanced"])
-        use_chat = preset["use_chat_template"]
-        winsorize = preset["winsorize_activations"]
-        winsorize_pct = preset.get("winsorize_percentile", 0.01)
-
-        for p in range(passes):
-            if progress_callback:
-                base = p / passes
-                span = 1.0 / passes
-                def cb(f, m):
-                    progress_callback(base + f * span, f"[Pass {p+1}/{passes}] {m}")
-
-            if progress_callback:
-                progress_callback(base, f"[Pass {p+1}/{passes}] PROBE...")
-
-            probe_r = self.probe(
-                harmful_prompts, harmless_prompts,
-                progress_callback=cb if passes > 1 else progress_callback,
-                use_chat_template=use_chat,
-                winsorize=winsorize,
-                winsorize_percentile=winsorize_pct,
-            )
-
-            if progress_callback:
-                progress_callback(base + 0.3 * span, f"[Pass {p+1}/{passes}] DISTILL...")
-
-            distill_r = self.distill(
-                probe_r, method=method,
-                progress_callback=cb if passes > 1 else progress_callback,
-            )
-
-            if progress_callback:
-                progress_callback(base + 0.5 * span, f"[Pass {p+1}/{passes}] EXCISE...")
-
-            excise_r = self.excise(
-                distill_r, method=method, strength=strength,
-                progress_callback=cb if passes > 1 else progress_callback,
-            )
-
-            pass_result = {
-                "pass": p + 1,
-                "n_directions": len(distill_r["directions"]),
-                "n_modified": excise_r["n_modified"],
-                "directions": [(int(li), float(sc)) for li, sc in distill_r["sorted_layers"][:3]],
-            }
-            all_results.append(pass_result)
-
-        return all_results
+    def compute_layer_adaptive_scale(self, layer_idx: int) -> float:
+        """Scale intervention strength per layer based on its refusal score."""
+        if not self.layer_refusal_scores or layer_idx not in self.layer_refusal_scores:
+            return 1.0
+        score = abs(self.layer_refusal_scores[layer_idx])
+        all_scores = [abs(s) for s in self.layer_refusal_scores.values()]
+        if max(all_scores) == min(all_scores):
+            return 1.0
+        normalized = (score - min(all_scores)) / (max(all_scores) - min(all_scores))
+        return 0.5 + normalized * 1.5  # range [0.5, 2.0]
 
     # ── FULL PIPELINE ───────────────────────────────────────────
 
@@ -1221,83 +1099,131 @@ class AbliterationEngine:
         One-to-one with Pliny's obliterate().
         """
         preset = METHOD_PRESETS.get(method, METHOD_PRESETS["advanced"])
+        self.norm_preserve = preset["norm_preserve"]
+        self.regularization = preset["regularization"]
+
         results = {
             "method": method,
-            "n_directions": preset["n_directions"],
-            "strength": strength,
-            "norm_preserve": preset["norm_preserve"],
-            "regularization": preset["regularization"],
-            "refinement_passes": preset["refinement_passes"],
+            "n_modified": 0,
+            "top_layers": [],
             "timing": {},
             "passes": [],
             "status": "running",
         }
 
-        # ── PROBE ──
+        # ── SUMMON ──
+        t0 = time.time()
         if progress_callback:
             progress_callback(0.0, "SUMMON: Engine initialized")
 
-        t0 = time.time()
-        if preset["refinement_passes"] > 1:
-            # Iterative refinement with multiple passes
-            passes = self.iterative_refinement(
-                harmful_prompts, harmless_prompts,
-                method=method, strength=strength,
-                passes=preset["refinement_passes"],
-                progress_callback=progress_callback,
-            )
-            results["passes"] = passes
-            results["timing"]["total"] = time.time() - t0
-            n_mod = sum(p["n_modified"] for p in passes) if passes else 0
-            results["n_modified"] = n_mod
-        else:
-            # Single pass
-            if progress_callback:
-                progress_callback(0.05, "PROBE: Collecting activations...")
+        self.model.eval()
 
-            probe_r = self.probe(
-                harmful_prompts, harmless_prompts,
-                progress_callback=progress_callback,
-                use_chat_template=preset["use_chat_template"],
-                winsorize=preset["winsorize_activations"],
-                winsorize_percentile=preset.get("winsorize_percentile", 0.01),
-            )
-            results["timing"]["probe"] = time.time() - t0
+        # ── PROBE ──
+        t1 = time.time()
+        if progress_callback:
+            progress_callback(0.05, "PROBE: Collecting harmful activations...")
 
-            if progress_callback:
-                progress_callback(0.45, f"PROBE: {self.num_layers} layers, {probe_r['hidden_size']} dim")
-
-            # ── DISTILL ──
-            t1 = time.time()
-            distill_r = self.distill(
-                probe_r, method=method,
-                progress_callback=progress_callback,
-            )
-            results["timing"]["distill"] = time.time() - t1
-            results["top_layers"] = [
-                (int(li), float(sc)) for li, sc in distill_r["sorted_layers"][:5]
-            ]
-            results["n_directions_found"] = distill_r["n_directions"]
-
-            # ── EXCISE ──
-            t2 = time.time()
-            excise_r = self.excise(
-                distill_r, method=method, strength=strength,
-                progress_callback=progress_callback,
-            )
-            results["timing"]["excise"] = time.time() - t2
-            results["n_modified"] = excise_r["n_modified"]
-            results["modified_params"] = excise_r["modified_params"]
-
-        results["status"] = "complete"
+        harmful_acts = self.collect_hidden_states(
+            harmful_prompts,
+            use_chat_template=preset["use_chat_template"],
+            winsorize=preset["winsorize_activations"],
+            winsorize_percentile=preset.get("winsorize_percentile", 0.01),
+        )
 
         if progress_callback:
-            progress_callback(1.0, f"✅ VERIFY: Complete! Modified {results['n_modified']} parameters")
+            progress_callback(0.15, "PROBE: Collecting harmless activations...")
 
+        harmless_acts = self.collect_hidden_states(
+            harmless_prompts,
+            use_chat_template=preset["use_chat_template"],
+            winsorize=preset["winsorize_activations"],
+            winsorize_percentile=preset.get("winsorize_percentile", 0.01),
+        )
+
+        results["timing"]["probe"] = round(time.time() - t1, 2)
+
+        # Number of refinement passes
+        n_passes = preset["refinement_passes"] + 1  # at least 1 pass
+        current_harmful = harmful_acts
+        current_harmless = harmless_acts
+
+        for pass_num in range(n_passes):
+            if progress_callback:
+                frac = 0.2 + (pass_num / n_passes) * 0.6
+                progress_callback(frac, f"DISTILL pass {pass_num+1}/{n_passes}: Extracting refusal directions...")
+
+            # ── DISTILL ──
+            t2 = time.time()
+            n_dirs = preset["n_directions"]
+
+            refusal_dirs = self.extract_refusal_directions(
+                current_harmful, current_harmless,
+                preset, n_dirs,
+            )
+
+            results["timing"][f"distill_pass_{pass_num}"] = round(time.time() - t2, 2)
+
+            # ── EXCISE ──
+            t3 = time.time()
+            if progress_callback:
+                progress_callback(0.3 + (pass_num / n_passes) * 0.3,
+                                  f"EXCISE pass {pass_num+1}/{n_passes}: Applying weight modifications...")
+
+            n_mod = self.perform_surgical_strike(
+                refusal_dirs, preset,
+                strength=strength,
+                progress_callback=progress_callback,
+                pass_num=pass_num,
+            )
+            results["n_modified"] += n_mod
+
+            pass_info = {
+                "pass": pass_num + 1,
+                "n_directions": len(refusal_dirs),
+                "n_modified": n_mod,
+            }
+            results["passes"].append(pass_info)
+            results["timing"][f"excise_pass_{pass_num}"] = round(time.time() - t3, 2)
+
+            # ── True iterative refinement: re-probe after excise ──
+            if preset.get("true_iterative_refinement", False) and pass_num < n_passes - 1:
+                if progress_callback:
+                    progress_callback(0.5 + (pass_num / n_passes) * 0.2,
+                                      f"PROBE (refinement pass {pass_num+1}): Re-collecting activations...")
+
+                current_harmful = self.collect_hidden_states(
+                    harmful_prompts,
+                    use_chat_template=preset["use_chat_template"],
+                    winsorize=preset["winsorize_activations"],
+                    winsorize_percentile=preset.get("winsorize_percentile", 0.01),
+                )
+                current_harmless = self.collect_hidden_states(
+                    harmless_prompts,
+                    use_chat_template=preset["use_chat_template"],
+                    winsorize=preset["winsorize_activations"],
+                    winsorize_percentile=preset.get("winsorize_percentile", 0.01),
+                )
+
+        # ── Top refusal layers ──
+        if self.layer_refusal_scores:
+            sorted_layers = sorted(
+                self.layer_refusal_scores.items(),
+                key=lambda x: abs(x[1]),
+                reverse=True,
+            )
+            results["top_layers"] = [
+                (int(li), round(score, 4)) for li, score in sorted_layers[:10]
+            ]
+
+        results["status"] = "complete"
+        results["timing"]["total"] = round(time.time() - t0, 2)
+
+        # Cleanup
         self._remove_hooks()
-        self.harmful_states = None
-        self.harmless_states = None
         empty_cache()
+
+        if progress_callback:
+            progress_callback(1.0, f"✅ REBIRTH: Model liberated! ({results['n_modified']} params modified)")
 
         return results
 
@@ -1516,7 +1442,7 @@ def page_obliterate():
     strength = st.slider("Intervention Strength α", 0.1, 2.0, 1.0, 0.1,
                          help="Higher = more aggressive removal. 1.0 is default.")
 
-    # Dataset selector (mirrors Pliny's Gradio dropdown)
+    # Dataset selector
     st.markdown("### Dataset")
     dataset_choice = st.selectbox(
         "Prompt dataset source",
@@ -1579,6 +1505,7 @@ def page_obliterate():
                 progress_callback=progress_callback,
             )
 
+            # CRITICAL: Store the modified model (in-place modifications were done on the same object)
             st.session_state.abliterated_model = st.session_state.model
             st.session_state.abliterated_tokenizer = st.session_state.tokenizer
             st.session_state.abliterated_name = f"{st.session_state.model_name} [OBLITERATED]"
@@ -1612,6 +1539,9 @@ def page_obliterate():
                     for p in results["passes"]:
                         st.caption(f"  Pass {p['pass']}: {p['n_directions']} directions, {p['n_modified']} params modified")
 
+            # Force a rerun so Chat/Benchmark pages see the updated model
+            st.rerun()
+
         except Exception as e:
             progress_bar.progress(0.0)
             status_text.error(f"❌ **Obliteration failed:** {e}")
@@ -1619,7 +1549,6 @@ def page_obliterate():
 
         finally:
             st.session_state.obliteration_running = False
-            st.rerun()
 
 
 def page_chat():
@@ -1666,6 +1595,8 @@ def page_chat():
                     st.markdown(response)
                     if is_refusal(response):
                         st.warning("⚠️ Refusal detected")
+                    else:
+                        st.success("✅ Complied (no refusal)")
                     st.session_state[chat_key].append({"role": "assistant", "content": response})
                 except Exception as e:
                     st.error(f"Generation failed: {e}")
