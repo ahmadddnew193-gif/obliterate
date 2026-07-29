@@ -66,14 +66,14 @@ logger = logging.getLogger("obliteratus")
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    PreTrainedModel,
-    PreTrainedTokenizerBase,
-)
-from transformers import BitsAndBytesConfig
 
+from transformers import BitsAndBytesConfig
+from transformers import AutoModelForCausalLM
+from transformers import AutoTokenizer
+from transformers import PreTrainedTokenizerBase
+
+from transformers import PreTrainedModel
+from transformers import BitsAndBytesConfig
 # ══════════════════════════════════════════════════════════════════════
 #  EXACT METHOD PRESETS (one-to-one with Pliny's original)
 # ══════════════════════════════════════════════════════════════════════
