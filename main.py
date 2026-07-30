@@ -1001,7 +1001,7 @@ BUILTIN_HARMLESS: list[str] = [
 ]
 
 assert len(BUILTIN_HARMFUL) == 576, f"Need 842 harmful prompts, got {len(BUILTIN_HARMFUL)}"
-assert len(BUILTIN_HARMLESS) == 576, f"Need 842 harmless prompts, got {len(BUILTIN_HARMLESS)}"
+assert len(BUILTIN_HARMLESS) == 680, f"Need 842 harmless prompts, got {len(BUILTIN_HARMLESS)}"
 
 # ══════════════════════════════════════════════════════════════════════════
 # EXTERNAL DATASET SUPPORT  (mirrors obliteratus/prompts.py)
