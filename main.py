@@ -1201,43 +1201,42 @@ def extract_refusal_directions(
 def norm_preserving_biprojection(
     weight: torch.Tensor,
     directions: list[torch.Tensor],
-    norm_ratio_limit: float = _MAX_NORM_RATIO,
+    norm_ratio_limit: float = 1.10,
     invert: bool = False,
 ) -> torch.Tensor:
-    """
-    Project refusal directions out of weight matrix with norm preservation.
-
-    This is grimjim's norm-preserving biprojection technique.
-    Instead of simply subtracting the projection (which can amplify remaining
-    components), we rescale to ensure the norm doesn't increase beyond
-    norm_ratio_limit (default 1.10 = 10% amplification).
-
-    When invert=True, we amplify rather than remove the direction
-    (compliance amplification — the "inverted" method).
-    """
+    """Project refusal directions out of weight matrix with correct dimensionality."""
     w = weight.to(torch.float32)
     original_norm = w.norm()
 
     for direction in directions:
         d = direction.to(w.device, torch.float32)
         d = d / (d.norm() + 1e-8)
+        
+        # Determine orientation: d shape vs w shape
+        # If d matches w.shape[0] (out_dim), we use left-multiplication
+        # If d matches w.shape[1] (in_dim), we use right-multiplication
+        if d.shape[0] == w.shape[0]:
+            # Direction is in output space (e.g., 576)
+            # Projection P = d * (d.T @ w)
+            proj = d.unsqueeze(-1) @ (d.unsqueeze(0) @ w)
+        else:
+            # Direction is in hidden/input space (e.g., 1536)
+            # Projection P = (w @ d) @ d.T
+            proj = (w @ d.unsqueeze(-1)) @ d.unsqueeze(0)
 
         if invert:
-            # Amplify compliance: project MORE of the model weights along this direction
-            proj = w @ d.unsqueeze(-1)  # [out_dim, 1]
-            w = w + proj @ d.unsqueeze(0)  # add back the projection
+            w = w + proj
         else:
-            # Remove refusal: project out the direction
-            proj = w @ d.unsqueeze(-1)  # [out_dim, 1]
-            w = w - proj @ d.unsqueeze(0)  # subtract projection
+            w = w - proj
 
-    # Norm-preserving rescaling: ensure norm doesn't blow up
+    # Rescale to preserve norm
     new_norm = w.norm()
     if new_norm > original_norm * norm_ratio_limit:
-        scale = (original_norm * norm_ratio_limit) / (new_norm + 1e-8)
-        w = w * scale
+        w = w * ((original_norm * norm_ratio_limit) / (new_norm + 1e-8))
 
     return w.to(weight.dtype)
+
+
 
 
 def get_weight_names(model, architecture: str) -> list[str]:
