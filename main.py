@@ -2795,7 +2795,10 @@ if _STREAMLIT_AVAILABLE:
             max_layer = st.slider("Max layer fraction:", 0.0, 1.0, 1.0)
 
         # Log area
-        log_area = st.empty()
+        # Log area — use session state to accumulate logs
+        if "oblit_logs" not in st.session_state:
+            st.session_state.oblit_logs = []
+        log_container = st.container()
         status_area = st.empty()
 
         # Progress display
