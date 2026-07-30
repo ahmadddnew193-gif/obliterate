@@ -2814,10 +2814,10 @@ if _STREAMLIT_AVAILABLE:
                 progress_bar.progress(stage_progress[stage_result.stage] + 1.0 / len(stage_order))
             if stage_result.status == "done":
                 log_area.markdown(f"✅ **{stage_result.stage.upper()}** — {stage_result.message}")
-
         def on_log_cb(msg):
-            current = log_area.text()
-            log_area.text(f"{current}\n  {msg}" if current else f"  {msg}")
+            st.session_state.oblit_logs.append(msg)
+            with log_container:
+                st.code("\n".join(st.session_state.oblit_logs[-50:]), language="")
 
         if st.button("🔥 OBLITERATE", type="primary", use_container_width=True,
                      disabled=not model_name):
