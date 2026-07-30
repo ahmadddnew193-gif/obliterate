@@ -2817,10 +2817,13 @@ if _STREAMLIT_AVAILABLE:
         def on_log_cb(msg):
             st.session_state.oblit_logs.append(msg)
             with log_container:
+                
                 st.code("\n".join(st.session_state.oblit_logs[-50:]), language="")
 
-        if st.button("🔥 OBLITERATE", type="primary", use_container_width=True,
-                     disabled=not model_name):
+        if st.button("🔥 OBLITERATE", type="primary", use_container_width=True,disabled=not model_name):
+            st.session_state.oblit_logs = []
+          
+                       
             if not model_name:
                 st.error("Enter a model name")
                 return
