@@ -1848,7 +1848,7 @@ BUILTIN_HARMLESS: list[str] = [
 ]
 
 assert len(BUILTIN_HARMFUL) == 1012, f"Need 576 harmful prompts, got {len(BUILTIN_HARMFUL)}"
-assert len(BUILTIN_HARMLESS) == 680, f"Need 680 harmless prompts, got {len(BUILTIN_HARMLESS)}"
+assert len(BUILTIN_HARMLESS) == 1012, f"Need 680 harmless prompts, got {len(BUILTIN_HARMLESS)}"
 
 # ══════════════════════════════════════════════════════════════════════════
 # EXTERNAL DATASET SUPPORT
