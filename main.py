@@ -1115,7 +1115,9 @@ def extract_refusal_directions(
 
     # Stack activations: layers × n_prompts × hidden_dim
     # Each activation is [n_tokens, hidden_dim] — we take mean over tokens
-    harmful_means = torch.stack([act.mean(dim=0) for act in harmful_activations])  # [n_prompts, hidden]
+    # Updated line:
+# Assuming act is [Batch, Seq, Hidden]
+    harmful_means = torch.stack([act.mean(dim=(0, 1)) for act in harmful_activations]) # [n_prompts, hidden]
     harmless_means = torch.stack([act.mean(dim=0) for act in harmless_activations])  # [n_prompts, hidden]
 
     diff = harmful_means - harmless_means  # [n_prompts, hidden]
