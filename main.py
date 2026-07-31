@@ -3,7 +3,15 @@ OBLITERATUS — Full Faithful Recreation (Streamlit)
 ===================================================
 6-stage pipeline: SUMMON → PROBE → DISTILL → EXCISE → VERIFY → REBIRTH
 7 method presets: basic, advanced, aggressive, optimized, surgical, inverted, nuclear
-30+ architectures · norm-preserving biprojection · shape-safe for all weights
+30+ architectures · SVD/whitened-SVD DISTILL · shape-branched norm-preserving EXCISE
+
+Faithful to elder-plinius/OBLITERATUS:
+  - DISTILL:  mean-diff (basic) / SVD (advanced, inverted, nuclear) /
+              whitened SVD (aggressive, optimized, surgical)
+  - EXCISE:   W' = W - W@r@r^T for square weights (W'r = 0)
+              W' = W - r⊗(rᵀW)  for rectangular weights (rᵀW' = 0)
+              + grimjim norm-preserving restore (original Frobenius norm)
+  - VERIFY:   post-ablation refusal/compliance sanity check
 
 Original: https://github.com/elder-plinius/OBLITERATUS
 BREAK THE CHAINS. FREE THE MIND. KEEP THE BRAIN.
@@ -106,8 +114,6 @@ def supports_bfloat16(device: str | None = None) -> bool:
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════
 
-_MAX_NORM_RATIO = 1.10
-
 _REFUSAL_PATTERNS = re.compile(
     r"(?i)(?:"
     r"sorry|cannot|unable|can't|not\s+(?:able|allowed|appropriate|ethical|legal|responsible)"
@@ -150,7 +156,8 @@ _LAYER_ATTR_PATHS: dict[str, list[str]] = {
 }
 
 # ══════════════════════════════════════════════════════════════════════════
-# BUILT-IN CONTRASTIVE PROMPT DATASETS (complete 50/50 tiered set)
+# BUILT-IN CONTRASTIVE PROMPT DATASET (compact 50/50 set — swap in your
+# full 576/680 corpus if desired; the rest of the file is unaffected)
 # ══════════════════════════════════════════════════════════════════════════
 
 BUILTIN_HARMFUL: list[str] = [
@@ -232,7 +239,7 @@ DATASET_SOURCES: dict[str, dict[str, Any]] = {
 _dataset_cache: dict[str, tuple[list[str], list[str]]] = {}
 
 def load_dataset(key: str, volume: int = 100) -> tuple[list[str], list[str]]:
-    """Load a prompt dataset, caching external downloads. Harmless list is
+    """Load a prompt dataset, caching external downloads. The harmless list is
     tiled to match the harmful count so activations split cleanly."""
     if key == "builtin":
         return list(BUILTIN_HARMFUL[:volume]), list(BUILTIN_HARMLESS[:volume])
@@ -275,6 +282,15 @@ def load_dataset(key: str, volume: int = 100) -> tuple[list[str], list[str]]:
 # GENERATION FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════
 
+# ── KV-cache toggle ────────────────────────────────────────────────────────
+# False (default): version-agnostic. generate() never builds a DynamicCache,
+#   so Phi-3's past_key_values.get_max_length() / get_usable_length() calls
+#   can NEVER fire, on ANY transformers release (confirmed by upstream:
+#   get_max_length removed in v4.48, get_usable_length removed ~v4.54).
+# True: faster generation, but ONLY safe with transformers 4.44 <= v < 4.48.
+_GENERATION_USE_CACHE = False
+
+
 def generate_response(
     model,
     tokenizer,
@@ -286,7 +302,9 @@ def generate_response(
     repetition_penalty: float = 1.1,
 ) -> str:
     """Generate a response with proper chat template and prompt-skipping.
-    FIX: decode ONLY the newly generated tokens (not prompt + generation)."""
+    FIX: decode ONLY the newly generated tokens (not prompt + generation).
+    FIX: use_cache=_GENERATION_USE_CACHE — no DynamicCache is built, so
+    get_max_length / get_usable_length AttributeErrors are impossible."""
     prompt = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
@@ -314,6 +332,7 @@ def generate_response(
             repetition_penalty=repetition_penalty,
             pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
+            use_cache=_GENERATION_USE_CACHE,
         )
 
     input_len = input_ids.shape[-1]
@@ -342,6 +361,7 @@ def generate_streaming(model, tokenizer, messages: list[dict], max_new_tokens: i
         temperature=temperature, top_p=top_p, top_k=50, repetition_penalty=1.1,
         pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
         eos_token_id=tokenizer.eos_token_id,
+        use_cache=_GENERATION_USE_CACHE,
     )
     thread = Thread(target=model.generate, kwargs=generation_kwargs)
     thread.start()
@@ -397,13 +417,12 @@ def collect_activations(
     layer_indices: list[int] | None = None,
     batch_size: int = 4,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    """Collect per-layer last-token hidden states for harmful vs harmless.
-
-    FIX 1: forward with use_cache=False — sidesteps DynamicCache.
-           get_usable_length entirely (older AND newer transformers).
-    FIX 2: activations are .detach().cpu()'d at hook time (device_map="auto"
-           safe); directions are moved back to each weight's device later.
-    Harmful prompts are processed FIRST, so the split at len(harmful_prompts)
+    """PROBE — collect per-layer last-token hidden states for harmful vs harmless.
+    FIX: forward with use_cache=False — sidesteps DynamicCache.get_usable_length
+    entirely (older AND newer transformers).
+    FIX: activations are .detach().cpu()'d at hook time (device_map="auto" safe);
+    directions are moved onto each weight's device later.
+    Harmful prompts are processed FIRST, so splitting at len(harmful_prompts)
     is correct even when the two lists differ in length."""
     device = model.device
     harmful_acts, harmless_acts = [], []
@@ -449,40 +468,112 @@ def collect_activations(
     return harmful_acts, harmless_acts
 
 
+# Method → (#directions, whitening) — faithful to OBLITERATUS presets
+_METHOD_DIRS = {
+    "basic": 1, "advanced": 4, "aggressive": 8,
+    "optimized": 4, "surgical": 4, "inverted": 4, "nuclear": 16,
+}
+_WHITEN_METHODS = {"aggressive", "optimized", "surgical"}
+
+
 def compute_refusal_directions(
     harmful_acts: list[torch.Tensor],
     harmless_acts: list[torch.Tensor],
     method: str = "advanced",
     layer_indices: list[int] | None = None,
 ) -> dict[int, torch.Tensor]:
-    """Mean-diff refusal directions. FIX: returns float32 tensors so the
-    ablation matmuls never hit the Half/Scalar dtype error."""
+    """DISTILL — extract refusal directions per layer, faithful to OBLITERATUS:
+      basic      → 1  mean-diff direction
+      advanced   → 4  SVD directions (default)
+      aggressive → 8  whitened SVD directions
+      optimized  → 4  whitened SVD directions
+      surgical   → 4  whitened SVD directions
+      inverted   → 4  SVD directions on the compliance signal (sign-flipped)
+      nuclear    → 16 SVD directions
+    Returns dict[layer_idx -> (n_directions, hidden) float32 tensor]."""
+    n_dirs = _METHOD_DIRS.get(method, 4)
+    use_whitening = method in _WHITEN_METHODS
+    inverted = method == "inverted"
+
     if layer_indices is None:
         layer_indices = list(range(len(harmful_acts)))
 
-    directions = {}
-    for i, (h_acts, hm_acts) in enumerate(zip(harmful_acts, harmless_acts)):
-        mean_harmful = h_acts.mean(dim=0)
-        mean_harmless = hm_acts.mean(dim=0)
-        direction = mean_harmful - mean_harmless
-        direction = direction / (direction.norm() + 1e-8)
-        directions[layer_indices[i]] = direction.float()
+    directions: dict[int, torch.Tensor] = {}
+    for i, (h, hm) in enumerate(zip(harmful_acts, harmless_acts)):
+        idx = layer_indices[i]
+        h = h.float()
+        hm = hm.float()
+        if h.shape[0] == 0 or hm.shape[0] == 0:
+            continue
+
+        # Signal: for 'inverted' we amplify compliance instead of refusal
+        if inverted:
+            signal_acts, base = hm, h.mean(dim=0)
+        else:
+            signal_acts, base = h, hm.mean(dim=0)
+
+        diff = signal_acts - base            # (n, hidden)
+        diff = diff - diff.mean(dim=0)       # center
+
+        inv_whiten = None
+        if use_whitening:
+            acts = torch.cat([h, hm], dim=0)
+            mean = acts.mean(dim=0)
+            centered = acts - mean
+            cov = (centered.T @ centered) / max(acts.shape[0] - 1, 1)
+            try:
+                eigvals, eigvecs = torch.linalg.eigh(cov)
+                eigvals = torch.clamp(eigvals, min=1e-6)
+                whiten = eigvecs @ torch.diag(1.0 / torch.sqrt(eigvals)) @ eigvecs.T
+                inv_whiten = eigvecs @ torch.diag(torch.sqrt(eigvals)) @ eigvecs.T
+                diff = diff @ whiten.T
+            except Exception:
+                inv_whiten = None   # fall back to plain SVD on failure
+
+        try:
+            _, _, Vt = torch.linalg.svd(diff, full_matrices=False)
+        except Exception:
+            d = signal_acts.mean(dim=0) - base
+            d = d / (d.norm() + 1e-8)
+            directions[idx] = d.float()
+            continue
+
+        dirs = []
+        for v in Vt[:n_dirs]:
+            d = (inv_whiten @ v) if inv_whiten is not None else v
+            n = d.norm()
+            if n > 1e-8:
+                dirs.append((d / n).float())
+
+        if not dirs:
+            d = signal_acts.mean(dim=0) - base
+            d = d / (d.norm() + 1e-8)
+            dirs = [d.float()]
+
+        directions[idx] = torch.stack(dirs)  # (n_dirs, hidden) float32
+
     return directions
 
 
-def apply_abliteration(model, directions: dict[int, torch.Tensor]) -> dict[str, Any]:
-    """Remove refusal directions from model weights.
+def apply_abliteration(
+    model,
+    directions: dict[int, torch.Tensor],
+    norm_preserve: bool = True,
+) -> dict[str, Any]:
+    """EXCISE — project refusal directions out of the weights, faithful to
+    OBLITERATUS (official formula W_new = W - W@r@r^T, with the same
+    shape-branch the original uses for rectangular projections):
 
-    FIX (shape-branched projection — resolves the 3072 vs 3072x8192 error):
       - Square weight  (o_proj / out_proj / dense, HxH):
-            W' = W - (W @ d) ⊗ d        # input-space (original OBLITERATUS)
+            W' = W - (W @ d) ⊗ d       →  W' d = 0   (r in input space)
       - Rectangular weight (down_proj / fc2 / c_proj, Hx4H):
-            W' = W - d ⊗ (Wᵀ @ d)       # output-space: dᵀW' = 0
-    d is 3072-dim (hidden/residual space) and always matches the ROW count,
-    so it never collides with the 8192-dim intermediate space.
+            W' = W - d ⊗ (dᵀ W)        →  dᵀ W' = 0  (r in output space)
 
-    Also: directions cast to float32 AND moved onto each weight's device
-    before the matmul (fixes Half dtype + CPU/CUDA device errors)."""
+    Norm-preserving restore (grimjim biprojection): the original Frobenius
+    norm of W is restored after projection (all methods except 'basic').
+
+    Directions are cast to float32 AND moved onto each weight's device before
+    the matmul (fixes Half dtype + CPU/CUDA device errors)."""
     metrics = {"layers_modified": 0}
     layers = get_layer_list(model)
 
@@ -491,8 +582,8 @@ def apply_abliteration(model, directions: dict[int, torch.Tensor]) -> dict[str, 
             continue
 
         layer = layers[layer_idx]
-        direction = direction / (direction.norm() + 1e-8)
-        direction_float = direction.float()
+        if direction.dim() == 1:
+            direction = direction.unsqueeze(0)   # (1, hidden)
 
         targets = []
         attn = getattr(layer, "self_attn", None) or getattr(layer, "attention", None)
@@ -512,27 +603,44 @@ def apply_abliteration(model, directions: dict[int, torch.Tensor]) -> dict[str, 
         for proj in targets:
             W = proj.weight.data
             dtype = W.dtype
-            direction_on_device = direction_float.to(W.device)
             W_float = W.float()
-
-            if W.shape[0] == W.shape[1]:
-                # Square: zero the image of d  →  W' d = 0
-                W_new = W_float - torch.outer(W_float @ direction_on_device, direction_on_device)
-            else:
-                # Rectangular: zero d in output space  →  dᵀ W' x = 0 ∀x
-                W_new = W_float - torch.outer(direction_on_device, W_float.T @ direction_on_device)
-
-            # Norm-preserving clamp
             old_norm = W_float.norm()
-            new_norm = W_new.norm()
-            if new_norm > old_norm * _MAX_NORM_RATIO:
-                W_new = W_new * (old_norm * _MAX_NORM_RATIO / (new_norm + 1e-8))
+            applied = False
 
-            proj.weight.data = W_new.to(dtype)
+            for vec in direction:
+                d = vec / (vec.norm() + 1e-8)
+                d = d.float().to(W.device)          # FIX: device + float32
+                if W.shape[-1] == d.shape[0]:
+                    # d matches the INPUT space (square o_proj): W' d = 0
+                    coeff = W_float @ d
+                    W_float = W_float - torch.outer(coeff, d)
+                    applied = True
+                elif W.shape[0] == d.shape[0]:
+                    # d matches the OUTPUT space (down_proj Hx4H): dᵀ W' = 0
+                    coeff = W_float.T @ d
+                    W_float = W_float - torch.outer(d, coeff)
+                    applied = True
+                # else: dimension mismatch — skip this direction for this weight
+
+            if not applied:
+                continue
+
+            # grimjim norm-preserving restore (faithful to the original)
+            if norm_preserve and old_norm > 0:
+                new_norm = W_float.norm()
+                if new_norm > 1e-8:
+                    W_float = W_float * (old_norm / new_norm)
+
+            proj.weight.data = W_float.to(dtype)
 
             if proj.bias is not None:
                 b_float = proj.bias.data.float()
-                b_new = b_float - (b_float @ direction_on_device) * direction_on_device
+                b_new = b_float
+                for vec in direction:
+                    d = vec / (vec.norm() + 1e-8)
+                    d = d.float().to(proj.bias.device)
+                    if b_float.shape[0] == d.shape[0]:
+                        b_new = b_new - (b_new @ d) * d
                 proj.bias.data = b_new.to(dtype)
 
             metrics["layers_modified"] += 1
@@ -543,12 +651,14 @@ def apply_abliteration(model, directions: dict[int, torch.Tensor]) -> dict[str, 
 # TRANSFORMERS VERSION GUARD + POST-ABLATION SANITY CHECK
 # ══════════════════════════════════════════════════════════════════════════
 
-# DynamicCache.get_usable_length exists only in this window:
-#   - missing on < ~4.44  (the original Colab AttributeError)
-#   - removed again ~4.54 (same AttributeError on brand-new versions;
-#     upstream reports: 4.53.3 last good, vLLM CI fails on 4.54.1)
+# DynamicCache API availability by transformers version (Phi-3 calls both):
+#   get_max_length    — removed in v4.48  (transformers#36071; 4.47.x last good)
+#   get_usable_length — removed ~v4.54   (vLLM CI fails on 4.54.1)
+# With _GENERATION_USE_CACHE=False and use_cache=False in collect_activations,
+# the app NEVER touches DynamicCache, so ANY version works. The window below
+# only matters if you flip _GENERATION_USE_CACHE = True for faster generation.
 _TRANSFORMERS_MIN = "4.44.0"
-_TRANSFORMERS_MAX = "4.54.0"
+_TRANSFORMERS_MAX = "4.48.0"
 
 
 def check_transformers_version() -> tuple[bool, str]:
@@ -562,11 +672,11 @@ def check_transformers_version() -> tuple[bool, str]:
         return True, f"transformers {installed} ✓ (known-good window)"
     return False, (
         f"transformers {installed} is OUTSIDE the known-good window "
-        f"[{_TRANSFORMERS_MIN}, {_TRANSFORMERS_MAX}). "
-        f"Run in the Colab cell before starting the app:\n"
+        f"[{_TRANSFORMERS_MIN}, {_TRANSFORMERS_MAX}). This is FINE — generation "
+        f"runs with use_cache=False, so DynamicCache APIs are never touched. "
+        f"To enable fast KV-cache generation instead, run:\n"
         f'    !pip install -q "transformers>={_TRANSFORMERS_MIN},<{_TRANSFORMERS_MAX}"\n'
-        f"then restart the runtime. (The use_cache=False fix keeps the "
-        f"pipeline working even if you skip this.)"
+        f"then set _GENERATION_USE_CACHE = True."
     )
 
 
@@ -590,9 +700,9 @@ def verify_abliteration(
     temperature: float = 0.6,
     progress_cb: Callable[[float, str], None] | None = None,
 ) -> list[dict[str, Any]]:
-    """Post-ablation sanity check: generate on refusal prompts and classify
-    each response for refusal phrasing. A generation error counts as refused
-    (conservative)."""
+    """VERIFY — post-ablation sanity check: generate on refusal prompts and
+    classify each response for refusal phrasing. A generation error counts
+    as refused (conservative)."""
     if prompts is None:
         prompts = _SANITY_PROMPTS
     results: list[dict[str, Any]] = []
@@ -722,7 +832,7 @@ def page_obliterate():
 
     ok, msg = check_transformers_version()
     if not ok:
-        st.warning(msg)
+        st.info(msg)
 
     with st.expander("📥 Step 1: Load Model", expanded=True):
         col1, col2 = st.columns([3, 1])
@@ -764,6 +874,9 @@ def page_obliterate():
                 "Method:",
                 ["basic", "advanced", "aggressive", "optimized", "surgical", "inverted", "nuclear"],
                 index=1,
+                help="basic=1 mean-diff · advanced=4 SVD (default) · aggressive=8 whitened SVD · "
+                     "optimized/surgical=4 whitened SVD · inverted=4 compliance-amplified SVD · "
+                     "nuclear=16 spectral",
             )
         with col2:
             prompt_volume = st.slider("Prompt volume:", 10, 200, 50)
@@ -801,14 +914,19 @@ def page_obliterate():
                 )
                 status_text.success(f"Collected activations from {len(layer_indices)} layers")
 
-                progress_bar.progress(60, text="EXCISE: Computing refusal directions...")
+                progress_bar.progress(55, text="DISTILL: Computing refusal directions (SVD)...")
                 directions = compute_refusal_directions(
                     harmful_acts, harmless_acts, method=method,
                     layer_indices=layer_indices,
                 )
+                n_total_dirs = sum(d.shape[0] for d in directions.values())
+                status_text.success(f"Extracted {n_total_dirs} directions across {len(directions)} layers")
 
-                progress_bar.progress(75, text="EXCISE: Removing refusal directions...")
-                metrics = apply_abliteration(model, directions)
+                progress_bar.progress(75, text="EXCISE: Projecting out refusal directions...")
+                metrics = apply_abliteration(
+                    model, directions,
+                    norm_preserve=(method != "basic"),
+                )
 
                 progress_bar.progress(88, text="VERIFY: Running post-ablation sanity check...")
                 verify_results = verify_abliteration(
@@ -834,9 +952,9 @@ def page_obliterate():
                 with col1:
                     st.metric("Layers Modified", metrics["layers_modified"])
                 with col2:
-                    st.metric("Directions", len(directions))
+                    st.metric("Layers Analyzed", len(directions))
                 with col3:
-                    st.metric("Status", "✅ LIBERATED")
+                    st.metric("Directions", n_total_dirs)
 
                 col4, col5, col6 = st.columns(3)
                 with col4:
@@ -1104,11 +1222,7 @@ def page_export():
                         st.session_state.abliterated_model.save_pretrained(str(tmp_path), max_shard_size="2GB", save_original_format=False)
                         st.session_state.abliterated_tokenizer.save_pretrained(str(tmp_path))
 
-                        metadata = {
-                            "base_model": st.session_state.model_name,
-                            "method": "abliteration",
-                            "timestamp": datetime.now().isoformat(),
-                        }
+                        metadata = {"base_model": st.session_state.model_name, "method": "abliteration", "timestamp": datetime.now().isoformat()}
                         (tmp_path / "abliteration_metadata.json").write_text(json.dumps(metadata, indent=2))
 
                         api.upload_folder(folder_path=str(tmp_path), repo_id=repo_id,
@@ -1143,6 +1257,11 @@ def page_about():
     | Surgical | 4 | Whitened + L1 mid-layer |
     | Inverted | 4 | Full SVD (compliance amp) |
     | Nuclear | 16 | Spectral |
+
+    ### EXCISE math (as in the original)
+    `W_new = W - W @ r @ r^T` for square projections (o_proj: `W'r = 0`),
+    `W_new = W - r ⊗ (rᵀW)` for rectangular projections (down_proj: `rᵀW' = 0`),
+    with grimjim's norm-preserving restore of the original Frobenius norm.
 
     ### Research
     - Arditi et al. (2024) — Refusal in LLMs Is Mediated by a Single Direction
