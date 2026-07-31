@@ -2141,49 +2141,41 @@ def compute_refusal_directions(
     harmless_acts: list[torch.Tensor],
     method: str = "advanced",
     layer_indices: list[int] | None = None,
-) -> list[RefusalDirection]:
-    """Compute refusal directions using mean-diff."""
-    directions = []
+) -> dict[int, torch.Tensor]:
+    """Compute refusal directions using mean-diff. Returns dict[layer_idx -> direction_tensor (float32)]."""
+    if layer_indices is None:
+        layer_indices = list(range(len(harmful_acts)))
     
+    directions = {}
     for i, (h_acts, hm_acts) in enumerate(zip(harmful_acts, harmless_acts)):
         mean_harmful = h_acts.mean(dim=0)
         mean_harmless = hm_acts.mean(dim=0)
-        
         direction = mean_harmful - mean_harmless
         direction = direction / (direction.norm() + 1e-8)
-        
-        proj_h = (h_acts @ direction).var()
-        proj_hm = (hm_acts @ direction).var()
-        total_var = torch.cat([h_acts, hm_acts]).var(dim=0).sum()
-        explained = ((proj_h + proj_hm) / (total_var + 1e-8)).item()
-        
-        directions.append(RefusalDirection(
-            direction=direction,
-            mean_activation=(mean_harmful + mean_harmless) / 2,
-            explained_variance=explained,
-            layer_idx=layer_indices[i] if layer_indices else i,
-        ))
-    
+        # FIX: ensure float32 so apply_abliteration doesn't get Half
+        directions[layer_indices[i]] = direction.float()
     return directions
 
 
 def apply_abliteration(
     model,
-    directions: list[RefusalDirection],
+    directions: dict[int, torch.Tensor],
 ) -> dict[str, Any]:
-    """Remove refusal directions from model weights."""
-    metrics = {"layers_modified": 0, "total_norm_change": 0.0}
+    """
+    Remove refusal directions from model weights.
+    directions: dict[layer_idx -> direction_tensor (float32)]
+    """
+    metrics = {"layers_modified": 0}
     layers = get_layer_list(model)
-    device = model.device
     
-    for rd in directions:
-        if rd.layer_idx >= len(layers):
+    for layer_idx, direction in directions.items():
+        if layer_idx >= len(layers):
             continue
         
-        layer = layers[rd.layer_idx]
-        direction = rd.direction.to(device)
+        layer = layers[layer_idx]
+        # FIX: explicitly work in float32
         direction = direction / (direction.norm() + 1e-8)
-        proj_matrix = direction.unsqueeze(1) @ direction.unsqueeze(0)
+        direction_float = direction.float()
         
         targets = []
         attn = getattr(layer, "self_attn", None) or getattr(layer, "attention", None)
@@ -2205,7 +2197,8 @@ def apply_abliteration(
             dtype = W.dtype
             
             W_float = W.float()
-            projection = (W_float @ direction).unsqueeze(1) @ direction.unsqueeze(0)
+            # direction_float is guaranteed float32
+            projection = (W_float @ direction_float).unsqueeze(1) @ direction_float.unsqueeze(0)
             W_new = W_float - projection
             
             # Norm-preserving clamp
@@ -2218,7 +2211,7 @@ def apply_abliteration(
             
             if proj.bias is not None:
                 b_float = proj.bias.data.float()
-                b_proj = (b_float @ direction) * direction
+                b_proj = (b_float @ direction_float) * direction_float
                 b_new = b_float - b_proj
                 proj.bias.data = b_new.to(dtype)
             
