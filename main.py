@@ -2163,7 +2163,7 @@ def apply_abliteration(
 ) -> dict[str, Any]:
     """
     Remove refusal directions from model weights.
-    directions: dict[layer_idx -> direction_tensor (float32)]
+    directions: dict[layer_idx -> direction_tensor]
     """
     metrics = {"layers_modified": 0}
     layers = get_layer_list(model)
@@ -2173,7 +2173,6 @@ def apply_abliteration(
             continue
         
         layer = layers[layer_idx]
-        # FIX: explicitly work in float32
         direction = direction / (direction.norm() + 1e-8)
         direction_float = direction.float()
         
@@ -2195,10 +2194,12 @@ def apply_abliteration(
         for proj in targets:
             W = proj.weight.data
             dtype = W.dtype
+            # FIX: move direction to the SAME device as the weight matrix
+            # (activations are collected on CPU, weights live on CUDA)
+            direction_on_device = direction_float.to(W.device)
             
             W_float = W.float()
-            # direction_float is guaranteed float32
-            projection = (W_float @ direction_float).unsqueeze(1) @ direction_float.unsqueeze(0)
+            projection = (W_float @ direction_on_device).unsqueeze(1) @ direction_on_device.unsqueeze(0)
             W_new = W_float - projection
             
             # Norm-preserving clamp
@@ -2211,7 +2212,7 @@ def apply_abliteration(
             
             if proj.bias is not None:
                 b_float = proj.bias.data.float()
-                b_proj = (b_float @ direction_float) * direction_float
+                b_proj = (b_float @ direction_on_device) * direction_on_device
                 b_new = b_float - b_proj
                 proj.bias.data = b_new.to(dtype)
             
