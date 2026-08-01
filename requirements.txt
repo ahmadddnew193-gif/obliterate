@@ -1,7 +1,3 @@
-# OBLITERATUS — verified dependency window
-# 4.47.x is the last release where BOTH get_max_length and get_usable_length
-# exist in DynamicCache (get_max_length removed in 4.48, get_usable_length ~4.54).
-# The app runs on ANY version because generation uses use_cache=False.
 transformers>=4.44.0,<4.48.0
 torch>=2.1.0
 streamlit>=1.33.0
